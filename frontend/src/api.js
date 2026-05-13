@@ -54,6 +54,11 @@ export const api = {
     list: () => req('GET', '/api/notifications'),
     readAll: () => req('POST', '/api/notifications/read-all'),
   },
+  jointAccounts: {
+    mine: () => req('GET', '/api/joint-accounts/mine'),
+    create: () => req('POST', '/api/joint-accounts'),
+    delete: () => req('DELETE', '/api/joint-accounts/mine'),
+  },
 };
 
 // ─── WebSocket manager ────────────────────────────────────────────────────────
