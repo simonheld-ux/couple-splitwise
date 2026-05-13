@@ -57,6 +57,14 @@ async function initSchema() {
     read BOOLEAN NOT NULL DEFAULT FALSE,
     created_at BIGINT NOT NULL DEFAULT (EXTRACT(EPOCH FROM NOW())*1000)::BIGINT
   )`);
+  await db.query(`CREATE TABLE IF NOT EXISTS joint_accounts (
+    id TEXT PRIMARY KEY,
+    couple_id TEXT NOT NULL UNIQUE,
+    name TEXT NOT NULL,
+    partner1_id TEXT NOT NULL,
+    partner2_id TEXT NOT NULL,
+    created_at BIGINT NOT NULL DEFAULT (EXTRACT(EPOCH FROM NOW())*1000)::BIGINT
+  )`);
   console.log("Schema ready");
 }
 
@@ -328,12 +336,25 @@ app.post("/api/expenses/settle-batch", auth, async (req,res)=>{
   const {rows:[me]} = await db.query("SELECT * FROM users WHERE id=$1",[req.userId]);
   const affected=new Set(), now=Date.now();
   for (const d of debts) {
+    // d.to may be a user id or a joint account id (ja_...)
+    const isJA = d.to && d.to.startsWith("ja_");
     const {rows:exps} = await db.query("SELECT * FROM expenses WHERE settled=FALSE AND paid_by=$1",[d.to]);
     for (const e of exps) {
       const splits=typeof e.splits==="object"?e.splits:JSON.parse(e.splits||"{}");
       if (splits[d.from]!=null) { await db.query("UPDATE expenses SET settled=TRUE,updated_at=$1 WHERE id=$2",[now,e.id]); affected.add(e.group_id); }
     }
-    if (d.to!==req.userId) {
+    if (isJA) {
+      // notify both partners of the joint account
+      const {rows:[ja]} = await db.query("SELECT * FROM joint_accounts WHERE id=$1",[d.to]);
+      if (ja) {
+        const msg=`${me.name} settled ${ja.name} debt`;
+        for (const pid of [ja.partner1_id,ja.partner2_id].filter(p=>p!==req.userId)) {
+          const nid=uuidv4();
+          await db.query("INSERT INTO notifications(id,user_id,message,created_at) VALUES($1,$2,$3,$4)",[nid,pid,msg,now]);
+          broadcastToUsers([pid],"notification",{id:nid,message:msg,read:false,createdAt:now});
+        }
+      }
+    } else if (d.to!==req.userId) {
       const nid=uuidv4(), msg=`${me.name} settled a debt with you`;
       await db.query("INSERT INTO notifications(id,user_id,message,created_at) VALUES($1,$2,$3,$4)",[nid,d.to,msg,now]);
       broadcastToUsers([d.to],"notification",{id:nid,message:msg,read:false,createdAt:now});
@@ -343,6 +364,44 @@ app.post("/api/expenses/settle-batch", auth, async (req,res)=>{
     const {rows} = await db.query("SELECT * FROM expenses WHERE group_id=$1",[gid]);
     await broadcastToGroup(gid,"expenses_batch_updated",{groupId:gid,expenses:rows.map(parseExp)});
   }
+  res.json({ok:true});
+});
+
+
+// Joint Accounts
+app.get("/api/joint-accounts/mine", auth, async (req,res)=>{
+  const {rows:[me]} = await db.query("SELECT * FROM users WHERE id=$1",[req.userId]);
+  if (!me.couple_id) return res.json({account:null});
+  const {rows:[ja]} = await db.query("SELECT * FROM joint_accounts WHERE couple_id=$1",[me.couple_id]);
+  res.json({account:ja?{id:ja.id,coupleId:ja.couple_id,name:ja.name,partner1Id:ja.partner1_id,partner2Id:ja.partner2_id,createdAt:Number(ja.created_at)}:null});
+});
+
+app.post("/api/joint-accounts", auth, async (req,res)=>{
+  const {rows:[me]} = await db.query("SELECT * FROM users WHERE id=$1",[req.userId]);
+  if (!me.couple_id) return res.status(400).json({error:"You must be linked as a couple first"});
+  const {rows:[existing]} = await db.query("SELECT id FROM joint_accounts WHERE couple_id=$1",[me.couple_id]);
+  if (existing) return res.status(409).json({error:"Joint account already exists"});
+  const {rows:[partner]} = await db.query("SELECT * FROM users WHERE couple_id=$1 AND id!=$2",[me.couple_id,req.userId]);
+  if (!partner) return res.status(400).json({error:"Partner not found"});
+  const id="ja_"+uuidv4(), now=Date.now();
+  const name=`${me.name} & ${partner.name}`;
+  await db.query("INSERT INTO joint_accounts(id,couple_id,name,partner1_id,partner2_id,created_at) VALUES($1,$2,$3,$4,$5,$6)",
+    [id,me.couple_id,name,req.userId,partner.id,now]);
+  const account={id,coupleId:me.couple_id,name,partner1Id:req.userId,partner2Id:partner.id,createdAt:now};
+  // Notify partner
+  const nid=uuidv4();
+  await db.query("INSERT INTO notifications(id,user_id,message,created_at) VALUES($1,$2,$3,$4)",[nid,partner.id,`${me.name} created your joint account 💳`,now]);
+  broadcastToUsers([partner.id],"joint_account_created",{account});
+  broadcastToUsers([partner.id],"notification",{id:nid,message:`${me.name} created your joint account 💳`,read:false,createdAt:now});
+  res.json({account});
+});
+
+app.delete("/api/joint-accounts/mine", auth, async (req,res)=>{
+  const {rows:[me]} = await db.query("SELECT * FROM users WHERE id=$1",[req.userId]);
+  if (!me.couple_id) return res.status(400).json({error:"Not in a couple"});
+  await db.query("DELETE FROM joint_accounts WHERE couple_id=$1",[me.couple_id]);
+  const {rows:[partner]} = await db.query("SELECT * FROM users WHERE couple_id=$1 AND id!=$2",[me.couple_id,req.userId]);
+  if (partner) broadcastToUsers([partner.id],"joint_account_deleted",{});
   res.json({ok:true});
 });
 
