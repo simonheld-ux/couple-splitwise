@@ -56,6 +56,7 @@ export const api = {
   },
   jointAccounts: {
     mine: () => req('GET', '/api/joint-accounts/mine'),
+    forGroup: (groupId) => req('GET', `/api/joint-accounts/group/${groupId}`),
     create: () => req('POST', '/api/joint-accounts'),
     delete: () => req('DELETE', '/api/joint-accounts/mine'),
   },
