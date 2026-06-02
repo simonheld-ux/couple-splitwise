@@ -459,7 +459,7 @@ start().catch(e=>{console.error("Fatal:",e);process.exit(1);});
 
 
 // TEMP DEBUG
-app.get("/api/debug/expenses", auth, async (req,res)=>{
+app.get("/api/debug/expenses", async (req,res)=>{
   try {
     const {rows:exps} = await db.query("SELECT id, description, amount, paid_by, splits, settled, group_id FROM expenses ORDER BY created_at DESC LIMIT 30");
     const {rows:users} = await db.query("SELECT id, name, couple_id FROM users");
