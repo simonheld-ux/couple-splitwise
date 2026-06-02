@@ -417,15 +417,6 @@ app.post("/api/notifications/read-all", auth, async (req,res)=>{
 });
 
 
-// TEMPORARY DEBUG ENDPOINT - remove after investigation
-app.get("/api/debug/data", async (req,res)=>{
-  try {
-    const {rows:users} = await db.query("SELECT id, name, email, couple_id FROM users ORDER BY created_at");
-    const {rows:jas} = await db.query("SELECT * FROM joint_accounts");
-    res.json({ users, joint_accounts: jas });
-  } catch(e) { res.status(500).json({error:e.message}); }
-});
-
 app.get("/api/health", async (req,res)=>{
   try { await db.query("SELECT 1"); res.json({ok:true,ts:Date.now(),db:"connected"}); }
   catch(e) { res.status(503).json({ok:false,error:e.message}); }
