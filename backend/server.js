@@ -416,6 +416,16 @@ app.post("/api/notifications/read-all", auth, async (req,res)=>{
   res.json({ok:true});
 });
 
+
+// TEMPORARY DEBUG ENDPOINT - remove after investigation
+app.get("/api/debug/data", async (req,res)=>{
+  try {
+    const {rows:users} = await db.query("SELECT id, name, email, couple_id FROM users ORDER BY created_at");
+    const {rows:jas} = await db.query("SELECT * FROM joint_accounts");
+    res.json({ users, joint_accounts: jas });
+  } catch(e) { res.status(500).json({error:e.message}); }
+});
+
 app.get("/api/health", async (req,res)=>{
   try { await db.query("SELECT 1"); res.json({ok:true,ts:Date.now(),db:"connected"}); }
   catch(e) { res.status(503).json({ok:false,error:e.message}); }
@@ -455,3 +465,17 @@ async function start() {
 }
 
 start().catch(e=>{console.error("Fatal:",e);process.exit(1);});
+
+// Get all joint accounts relevant to a group
+app.get("/api/joint-accounts/group/:groupId", auth, async (req,res)=>{
+  const {groupId} = req.params;
+  const {rows:[m]} = await db.query("SELECT 1 FROM group_members WHERE group_id=$1 AND user_id=$2",[groupId,req.userId]);
+  if (!m) return res.status(403).json({error:"Not a member"});
+  // Find all couple_ids in this group
+  const {rows:members} = await db.query("SELECT couple_id FROM users WHERE id IN (SELECT user_id FROM group_members WHERE group_id=$1) AND couple_id IS NOT NULL",[groupId]);
+  const coupleIds=[...new Set(members.map(r=>r.couple_id))];
+  if (coupleIds.length===0) return res.json({accounts:[]});
+  const placeholders=coupleIds.map((_,i)=>`$${i+1}`).join(',');
+  const {rows:accounts} = await db.query(`SELECT * FROM joint_accounts WHERE couple_id IN (${placeholders})`,coupleIds);
+  res.json({accounts:accounts.map(a=>({id:a.id,coupleId:a.couple_id,name:a.name,partner1Id:a.partner1_id,partner2Id:a.partner2_id}))});
+});
