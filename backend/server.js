@@ -457,6 +457,17 @@ async function start() {
 
 start().catch(e=>{console.error("Fatal:",e);process.exit(1);});
 
+
+// TEMP DEBUG
+app.get("/api/debug/expenses", auth, async (req,res)=>{
+  try {
+    const {rows:exps} = await db.query("SELECT id, description, amount, paid_by, splits, settled, group_id FROM expenses ORDER BY created_at DESC LIMIT 30");
+    const {rows:users} = await db.query("SELECT id, name, couple_id FROM users");
+    const {rows:jas} = await db.query("SELECT id, couple_id, name, partner1_id, partner2_id FROM joint_accounts");
+    res.json({ expenses: exps, users, joint_accounts: jas });
+  } catch(e) { res.status(500).json({error:e.message}); }
+});
+
 // Get all joint accounts relevant to a group
 app.get("/api/joint-accounts/group/:groupId", auth, async (req,res)=>{
   const {groupId} = req.params;
