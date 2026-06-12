@@ -3,7 +3,7 @@ import { api, wsManager, getToken, setToken } from './api';
 const C={bg:'#0c0c10',surface:'#15151c',card:'#1b1b25',border:'#252535',accent:'#5bffc8',accentDim:'#162e26',danger:'#ff5f6d',dangerDim:'#2d1215',warn:'#ffb347',warnDim:'#2d200e',purple:'#a78bfa',purpleDim:'#1e1535',text:'#eaeaf4',sub:'#9898b0',muted:'#5a5a72'};
 const CURRENCIES={EUR:{code:'EUR',symbol:'€',label:'Euro (€)',position:'before',decimals:2},DKK:{code:'DKK',symbol:'kr',label:'Danish Krone (kr)',position:'after',decimals:2}};
 const DEFAULT_CURRENCY='EUR';
-function fmt(n,currency=DEFAULT_CURRENCY){const cur=CURRENCIES[currency]||CURRENCIES[DEFAULT_CURRENCY];const val=Math.abs(n).toFixed(cur.decimals);return cur.position==='before'?`${cur.symbol}${val}`:`${val} ${cur.symbol}`;}
+function fmt(n,currency=DEFAULT_CURRENCY){const cur=CURRENCIES[currency]||CURRENCIES[DEFAULT_CURRENCY];const num=Number(n);const val=Math.abs(isFinite(num)?num:0).toFixed(cur.decimals);return cur.position==='before'?`${cur.symbol}${val}`:`${val} ${cur.symbol}`;}
 const CAT={food:'🍔',drinks:'🍺',housing:'🏠',utilities:'💡',transport:'🚗',entertainment:'🎬',travel:'✈️',shopping:'🛍️',health:'💊',fitness:'🏋️',subscriptions:'📱',settlement:'🤝',other:'💸'};
 const SPLIT_TYPES=[{id:'equal',label:'Split equally'},{id:'exact',label:'Exact amounts'},{id:'percentage',label:'By percentage'},{id:'payer_covers',label:'Payer covers all'}];
 const AVATARS=['🧑','👩','🧔','👱','🧕','👨','🧒','👴','🦸','🧙','🧜','🧚'];
