@@ -65,6 +65,10 @@ async function initSchema() {
     partner2_id TEXT NOT NULL,
     created_at BIGINT NOT NULL DEFAULT (EXTRACT(EPOCH FROM NOW())*1000)::BIGINT
   )`);
+  // Soft-delete: JA rows must survive deletion because old expenses keep
+  // paid_by=ja_... — without the row, debt math re-charges partners for
+  // their own past JA expenses.
+  await db.query(`ALTER TABLE joint_accounts ADD COLUMN IF NOT EXISTS deleted BOOLEAN NOT NULL DEFAULT FALSE`);
   console.log("Schema ready");
 }
 
@@ -179,8 +183,12 @@ app.patch("/api/users/me", auth, async (req,res)=>{
 app.post("/api/users/couple", auth, async (req,res)=>{
   const {partnerId} = req.body;
   if (!partnerId) return res.status(400).json({error:"partnerId required"});
+  if (partnerId===req.userId) return res.status(400).json({error:"You cannot link with yourself"});
   const {rows:[partner]} = await db.query("SELECT * FROM users WHERE id=$1",[partnerId]);
   if (!partner) return res.status(404).json({error:"User not found"});
+  if (partner.couple_id) return res.status(409).json({error:"That user is already in a couple"});
+  const {rows:[meRow]} = await db.query("SELECT couple_id FROM users WHERE id=$1",[req.userId]);
+  if (meRow.couple_id) return res.status(409).json({error:"You are already in a couple — unlink first"});
   const coupleId=uuidv4(), now=Date.now();
   await db.query("UPDATE users SET couple_id=$1 WHERE id=ANY($2)",[coupleId,[req.userId,partnerId]]);
   const {rows:[me]} = await db.query("SELECT * FROM users WHERE id=$1",[req.userId]);
@@ -195,8 +203,13 @@ app.delete("/api/users/couple", auth, async (req,res)=>{
   const {rows:[me]} = await db.query("SELECT * FROM users WHERE id=$1",[req.userId]);
   if (me.couple_id) {
     const {rows:[p]} = await db.query("SELECT * FROM users WHERE couple_id=$1 AND id!=$2",[me.couple_id,req.userId]);
+    // Retire the couple's joint account too (soft delete keeps old expenses valid)
+    await db.query("UPDATE joint_accounts SET deleted=TRUE WHERE couple_id=$1",[me.couple_id]);
     await db.query("UPDATE users SET couple_id=NULL WHERE couple_id=$1",[me.couple_id]);
-    if (p) broadcastToUsers([p.id],"couple_unlinked",{});
+    if (p) {
+      broadcastToUsers([p.id],"couple_unlinked",{});
+      broadcastToUsers([p.id],"joint_account_deleted",{});
+    }
   }
   res.json({ok:true});
 });
@@ -283,7 +296,10 @@ app.get("/api/expenses", auth, async (req,res)=>{
 
 app.post("/api/expenses", auth, async (req,res)=>{
   const {description,amount,paidBy,groupId,category,date,splitType,participants,splits,note} = req.body;
-  if (!description||!amount||!groupId) return res.status(400).json({error:"description, amount, groupId required"});
+  if (!description||typeof description!=="string"||!amount||!groupId) return res.status(400).json({error:"description, amount, groupId required"});
+  if (!isFinite(Number(amount))||Number(amount)<=0) return res.status(400).json({error:"amount must be a positive number"});
+  if (participants!==undefined&&!Array.isArray(participants)) return res.status(400).json({error:"participants must be an array"});
+  if (splits!==undefined&&(typeof splits!=="object"||splits===null||Array.isArray(splits))) return res.status(400).json({error:"splits must be an object"});
   const {rows:[m]} = await db.query("SELECT 1 FROM group_members WHERE group_id=$1 AND user_id=$2",[groupId,req.userId]);
   if (!m) return res.status(403).json({error:"Not a member"});
   const id=uuidv4(), now=Date.now();
@@ -304,6 +320,10 @@ app.patch("/api/expenses/:id", auth, async (req,res)=>{
   if (!m) return res.status(403).json({error:"Not a member"});
   const now=Date.now();
   const {description,amount,paidBy,category,date,splitType,participants,splits,settled,note} = req.body;
+  if (description!==undefined&&typeof description!=="string") return res.status(400).json({error:"description must be a string"});
+  if (amount!==undefined&&(!isFinite(Number(amount))||Number(amount)<=0)) return res.status(400).json({error:"amount must be a positive number"});
+  if (participants!==undefined&&!Array.isArray(participants)) return res.status(400).json({error:"participants must be an array"});
+  if (splits!==undefined&&(typeof splits!=="object"||splits===null||Array.isArray(splits))) return res.status(400).json({error:"splits must be an object"});
   if (description!==undefined) await db.query("UPDATE expenses SET description=$1,updated_at=$2 WHERE id=$3",[description.trim(),now,req.params.id]);
   if (amount!==undefined)      await db.query("UPDATE expenses SET amount=$1,updated_at=$2 WHERE id=$3",[amount,now,req.params.id]);
   if (paidBy!==undefined)      await db.query("UPDATE expenses SET paid_by=$1,updated_at=$2 WHERE id=$3",[paidBy,now,req.params.id]);
@@ -330,41 +350,83 @@ app.delete("/api/expenses/:id", auth, async (req,res)=>{
   res.json({ok:true});
 });
 
+// Settling works by RECORDING A PAYMENT, not by flipping `settled` flags.
+// The debts sent here come from the frontend's computeDebts(), which are
+// simplified/remapped/netted — they no longer map 1:1 onto expenses, so
+// marking whole expenses settled corrupts other members' balances.
+// A payment expense (paid_by=debtor, splits={creditor: amount}) nets the
+// debt to exactly zero in computeDebts regardless of simplification.
 app.post("/api/expenses/settle-batch", auth, async (req,res)=>{
-  const {debts} = req.body;
-  if (!Array.isArray(debts)) return res.status(400).json({error:"debts array required"});
-  const {rows:[me]} = await db.query("SELECT * FROM users WHERE id=$1",[req.userId]);
-  const affected=new Set(), now=Date.now();
-  for (const d of debts) {
-    // d.to may be a user id or a joint account id (ja_...)
-    const isJA = d.to && d.to.startsWith("ja_");
-    const {rows:exps} = await db.query("SELECT * FROM expenses WHERE settled=FALSE AND paid_by=$1",[d.to]);
-    for (const e of exps) {
-      const splits=typeof e.splits==="object"?e.splits:JSON.parse(e.splits||"{}");
-      if (splits[d.from]!=null) { await db.query("UPDATE expenses SET settled=TRUE,updated_at=$1 WHERE id=$2",[now,e.id]); affected.add(e.group_id); }
+  try {
+    const {debts} = req.body;
+    if (!Array.isArray(debts)||debts.length===0) return res.status(400).json({error:"debts array required"});
+    const {rows:[me]} = await db.query("SELECT * FROM users WHERE id=$1",[req.userId]);
+    // A user may settle their own debts, or their couple partner's
+    const allowedFrom=new Set([req.userId]);
+    if (me.couple_id) {
+      const {rows:partners} = await db.query("SELECT id FROM users WHERE couple_id=$1 AND id!=$2",[me.couple_id,req.userId]);
+      partners.forEach(p=>allowedFrom.add(p.id));
     }
-    if (isJA) {
-      // notify both partners of the joint account
-      const {rows:[ja]} = await db.query("SELECT * FROM joint_accounts WHERE id=$1",[d.to]);
-      if (ja) {
-        const msg=`${me.name} settled ${ja.name} debt`;
-        for (const pid of [ja.partner1_id,ja.partner2_id].filter(p=>p!==req.userId)) {
-          const nid=uuidv4();
-          await db.query("INSERT INTO notifications(id,user_id,message,created_at) VALUES($1,$2,$3,$4)",[nid,pid,msg,now]);
-          broadcastToUsers([pid],"notification",{id:nid,message:msg,read:false,createdAt:now});
-        }
+    const {rows:myGroupRows} = await db.query("SELECT group_id FROM group_members WHERE user_id=$1",[req.userId]);
+    const myGroupIds=myGroupRows.map(r=>r.group_id);
+    const affected=new Set(), now=Date.now(), payments=[];
+    // Validate everything before writing anything
+    for (const d of debts) {
+      if (!d||typeof d.from!=="string"||typeof d.to!=="string") return res.status(400).json({error:"each debt needs from and to"});
+      if (d.from===d.to) return res.status(400).json({error:"from and to must differ"});
+      const amount=Math.round(Number(d.amount)*100)/100;
+      if (!isFinite(amount)||amount<=0) return res.status(400).json({error:"each debt needs a positive amount"});
+      if (!allowedFrom.has(d.from)) return res.status(403).json({error:"You can only settle your own debts or your partner's"});
+      d._amount=amount;
+    }
+    for (const d of debts) {
+      // Resolve creditor: a user id, or a joint account (credit goes to the JA itself)
+      let creditorUserIds=[d.to], toName, ja=null;
+      if (d.to.startsWith("ja_")) {
+        ({rows:[ja]} = await db.query("SELECT * FROM joint_accounts WHERE id=$1",[d.to]));
+        if (!ja) return res.status(400).json({error:"Unknown joint account"});
+        creditorUserIds=[ja.partner1_id,ja.partner2_id];
+        toName=ja.name;
+      } else {
+        const {rows:[tu]} = await db.query("SELECT name FROM users WHERE id=$1",[d.to]);
+        if (!tu) return res.status(400).json({error:"Unknown creditor"});
+        toName=tu.name;
       }
-    } else if (d.to!==req.userId) {
-      const nid=uuidv4(), msg=`${me.name} settled a debt with you`;
-      await db.query("INSERT INTO notifications(id,user_id,message,created_at) VALUES($1,$2,$3,$4)",[nid,d.to,msg,now]);
-      broadcastToUsers([d.to],"notification",{id:nid,message:msg,read:false,createdAt:now});
+      const {rows:[fu]} = await db.query("SELECT name FROM users WHERE id=$1",[d.from]);
+      if (!fu) return res.status(400).json({error:"Unknown debtor"});
+      // Pick a group shared by requester, debtor and creditor — prefer the one
+      // holding the most recent unsettled expense paid by the creditor
+      const {rows:shared} = await db.query(
+        `SELECT DISTINCT gm1.group_id FROM group_members gm1
+         JOIN group_members gm2 ON gm2.group_id=gm1.group_id
+         WHERE gm1.user_id=$1 AND gm2.user_id=ANY($2) AND gm1.group_id=ANY($3)`,
+        [d.from,creditorUserIds,myGroupIds]);
+      if (!shared.length) return res.status(400).json({error:"No shared group found for this debt"});
+      let gid=shared[0].group_id;
+      const {rows:[pref]} = await db.query(
+        "SELECT group_id FROM expenses WHERE settled=FALSE AND paid_by=$1 AND group_id=ANY($2) ORDER BY created_at DESC LIMIT 1",
+        [d.to,shared.map(r=>r.group_id)]);
+      if (pref) gid=pref.group_id;
+      const id=uuidv4();
+      await db.query(
+        "INSERT INTO expenses(id,description,amount,paid_by,group_id,category,date,split_type,participants,splits,settled,note,created_by,created_at,updated_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,FALSE,$11,$12,$13,$14)",
+        [id,`${fu.name} paid ${toName}`,d._amount,d.from,gid,"settlement",new Date(now).toISOString().split("T")[0],"settlement",JSON.stringify([d.to]),JSON.stringify({[d.to]:d._amount}),"Settle-up payment",req.userId,now,now]);
+      affected.add(gid);
+      payments.push(id);
+      // Notify the creditor(s)
+      const msg=`${me.name} settled up: ${fu.name} paid ${toName} ${d._amount.toFixed(2)}`;
+      for (const pid of creditorUserIds.filter(p=>p!==req.userId)) {
+        const nid=uuidv4();
+        await db.query("INSERT INTO notifications(id,user_id,message,created_at) VALUES($1,$2,$3,$4)",[nid,pid,msg,now]);
+        broadcastToUsers([pid],"notification",{id:nid,message:msg,read:false,createdAt:now});
+      }
     }
-  }
-  for (const gid of affected) {
-    const {rows} = await db.query("SELECT * FROM expenses WHERE group_id=$1",[gid]);
-    await broadcastToGroup(gid,"expenses_batch_updated",{groupId:gid,expenses:rows.map(parseExp)});
-  }
-  res.json({ok:true});
+    for (const gid of affected) {
+      const {rows} = await db.query("SELECT * FROM expenses WHERE group_id=$1",[gid]);
+      await broadcastToGroup(gid,"expenses_batch_updated",{groupId:gid,expenses:rows.map(parseExp)});
+    }
+    res.json({ok:true,paymentIds:payments});
+  } catch(e){console.error("Settle-batch:",e.message);res.status(500).json({error:"Server error"});}
 });
 
 
@@ -372,17 +434,25 @@ app.post("/api/expenses/settle-batch", auth, async (req,res)=>{
 app.get("/api/joint-accounts/mine", auth, async (req,res)=>{
   const {rows:[me]} = await db.query("SELECT * FROM users WHERE id=$1",[req.userId]);
   if (!me.couple_id) return res.json({account:null});
-  const {rows:[ja]} = await db.query("SELECT * FROM joint_accounts WHERE couple_id=$1",[me.couple_id]);
+  const {rows:[ja]} = await db.query("SELECT * FROM joint_accounts WHERE couple_id=$1 AND deleted=FALSE",[me.couple_id]);
   res.json({account:ja?{id:ja.id,coupleId:ja.couple_id,name:ja.name,partner1Id:ja.partner1_id,partner2Id:ja.partner2_id,createdAt:Number(ja.created_at)}:null});
 });
 
 app.post("/api/joint-accounts", auth, async (req,res)=>{
   const {rows:[me]} = await db.query("SELECT * FROM users WHERE id=$1",[req.userId]);
   if (!me.couple_id) return res.status(400).json({error:"You must be linked as a couple first"});
-  const {rows:[existing]} = await db.query("SELECT id FROM joint_accounts WHERE couple_id=$1",[me.couple_id]);
-  if (existing) return res.status(409).json({error:"Joint account already exists"});
+  const {rows:[existing]} = await db.query("SELECT * FROM joint_accounts WHERE couple_id=$1",[me.couple_id]);
+  if (existing && !existing.deleted) return res.status(409).json({error:"Joint account already exists"});
   const {rows:[partner]} = await db.query("SELECT * FROM users WHERE couple_id=$1 AND id!=$2",[me.couple_id,req.userId]);
   if (!partner) return res.status(400).json({error:"Partner not found"});
+  if (existing) {
+    // Same couple re-creating: restore the soft-deleted account so old
+    // expenses keep pointing at a live JA
+    await db.query("UPDATE joint_accounts SET deleted=FALSE WHERE id=$1",[existing.id]);
+    const account={id:existing.id,coupleId:existing.couple_id,name:existing.name,partner1Id:existing.partner1_id,partner2Id:existing.partner2_id,createdAt:Number(existing.created_at)};
+    broadcastToUsers([partner.id],"joint_account_created",{account});
+    return res.json({account});
+  }
   const id="ja_"+uuidv4(), now=Date.now();
   const name=`${me.name} & ${partner.name}`;
   await db.query("INSERT INTO joint_accounts(id,couple_id,name,partner1_id,partner2_id,created_at) VALUES($1,$2,$3,$4,$5,$6)",
@@ -399,7 +469,7 @@ app.post("/api/joint-accounts", auth, async (req,res)=>{
 app.delete("/api/joint-accounts/mine", auth, async (req,res)=>{
   const {rows:[me]} = await db.query("SELECT * FROM users WHERE id=$1",[req.userId]);
   if (!me.couple_id) return res.status(400).json({error:"Not in a couple"});
-  await db.query("DELETE FROM joint_accounts WHERE couple_id=$1",[me.couple_id]);
+  await db.query("UPDATE joint_accounts SET deleted=TRUE WHERE couple_id=$1",[me.couple_id]);
   const {rows:[partner]} = await db.query("SELECT * FROM users WHERE couple_id=$1 AND id!=$2",[me.couple_id,req.userId]);
   if (partner) broadcastToUsers([partner.id],"joint_account_deleted",{});
   res.json({ok:true});
@@ -463,11 +533,13 @@ app.get("/api/joint-accounts/group/:groupId", auth, async (req,res)=>{
   const {groupId} = req.params;
   const {rows:[m]} = await db.query("SELECT 1 FROM group_members WHERE group_id=$1 AND user_id=$2",[groupId,req.userId]);
   if (!m) return res.status(403).json({error:"Not a member"});
-  // Find all couple_ids in this group
-  const {rows:members} = await db.query("SELECT couple_id FROM users WHERE id IN (SELECT user_id FROM group_members WHERE group_id=$1) AND couple_id IS NOT NULL",[groupId]);
-  const coupleIds=[...new Set(members.map(r=>r.couple_id))];
-  if (coupleIds.length===0) return res.json({accounts:[]});
-  const placeholders=coupleIds.map((_,i)=>`$${i+1}`).join(',');
-  const {rows:accounts} = await db.query(`SELECT * FROM joint_accounts WHERE couple_id IN (${placeholders})`,coupleIds);
+  // Active JAs of couples in this group, PLUS any JA (even retired) still
+  // referenced by this group's expenses — debt math needs partner ids for those
+  const {rows:accounts} = await db.query(
+    `SELECT * FROM joint_accounts WHERE (deleted=FALSE AND couple_id IN (
+       SELECT DISTINCT couple_id FROM users WHERE couple_id IS NOT NULL
+         AND id IN (SELECT user_id FROM group_members WHERE group_id=$1)))
+     OR id IN (SELECT DISTINCT paid_by FROM expenses WHERE group_id=$1 AND paid_by LIKE 'ja\\_%')`,
+    [groupId]);
   res.json({accounts:accounts.map(a=>({id:a.id,coupleId:a.couple_id,name:a.name,partner1Id:a.partner1_id,partner2Id:a.partner2_id}))});
 });
