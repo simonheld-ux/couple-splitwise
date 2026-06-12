@@ -8,6 +8,7 @@ const CAT={food:'🍔',drinks:'🍺',housing:'🏠',utilities:'💡',transport:'
 const SPLIT_TYPES=[{id:'equal',label:'Split equally'},{id:'exact',label:'Exact amounts'},{id:'percentage',label:'By percentage'},{id:'payer_covers',label:'Payer covers all'}];
 const AVATARS=['🧑','👩','🧔','👱','🧕','👨','🧒','👴','🦸','🧙','🧜','🧚'];
 function computeDebts(expenses,users,allJointAccounts){const jaMap={};(allJointAccounts||[]).forEach(ja=>{jaMap[ja.id]=ja;});const net={};users.forEach(u=>{net[u.id]=0;});Object.keys(jaMap).forEach(jaId=>{net[jaId]=0;});expenses.forEach(e=>{if(e.paidBy&&e.paidBy.startsWith('ja_')&&!(e.paidBy in net))net[e.paidBy]=0;Object.keys(e.splits||{}).forEach(k=>{if(k.startsWith('ja_')&&!(k in net))net[k]=0;});});expenses.filter(e=>!e.settled).forEach(e=>{const ja=e.paidBy&&e.paidBy.startsWith('ja_')?jaMap[e.paidBy]:null;const jaPartners=ja?[ja.partner1Id,ja.partner2Id]:[];Object.entries(e.splits).forEach(([uid,share])=>{if(uid===e.paidBy||!(uid in net))return;if(jaPartners.includes(uid))return;net[uid]=(net[uid]||0)-share;net[e.paidBy]=(net[e.paidBy]||0)+share;})});const pos=[],neg=[];Object.entries(net).forEach(([id,v])=>{if(v>0.01)pos.push({id,v});else if(v<-0.01)neg.push({id,v:-v});});pos.sort((a,b)=>b.v-a.v);neg.sort((a,b)=>b.v-a.v);const debts=[];let i=0,j=0;while(i<pos.length&&j<neg.length){const a=Math.min(pos[i].v,neg[j].v);debts.push({from:neg[j].id,to:pos[i].id,amount:Math.round(a*100)/100});pos[i].v-=a;neg[j].v-=a;if(pos[i].v<0.01)i++;if(neg[j].v<0.01)j++;}const remapped=debts.map(d=>{if(!d.to.startsWith('ja_'))return d;const rja=jaMap[d.to];if(!rja)return d;if(d.from===rja.partner1Id)return{...d,to:rja.partner2Id};if(d.from===rja.partner2Id)return{...d,to:rja.partner1Id};return d;});const consolidated=[];const seen=new Set();remapped.forEach(d=>{const key=[d.from,d.to].sort().join('|');if(seen.has(key))return;seen.add(key);const opp=remapped.find(x=>x.from===d.to&&x.to===d.from);if(opp){const n=Math.round((d.amount-opp.amount)*100)/100;if(n>0.01)consolidated.push({from:d.from,to:d.to,amount:n});else if(n<-0.01)consolidated.push({from:d.to,to:d.from,amount:-n});}else consolidated.push(d);});return consolidated;}
+function computeDirectDebts(expenses,allJointAccounts){const jaMap={};(allJointAccounts||[]).forEach(ja=>{jaMap[ja.id]=ja;});const pair={};expenses.filter(e=>!e.settled).forEach(e=>{const payer=e.paidBy;const ja=payer&&payer.startsWith('ja_')?jaMap[payer]:null;const jaPartners=ja?[ja.partner1Id,ja.partner2Id]:[];Object.entries(e.splits||{}).forEach(([uid,share])=>{if(uid===payer||jaPartners.includes(uid))return;const k=uid+'>'+payer;pair[k]=(pair[k]||0)+share;});});const out=[];const seen=new Set();Object.keys(pair).forEach(k=>{const i=k.indexOf('>');const from=k.slice(0,i),to=k.slice(i+1);const fk=from+'>'+to,rk=to+'>'+from;if(seen.has(fk))return;seen.add(fk);seen.add(rk);const n=Math.round(((pair[fk]||0)-(pair[rk]||0))*100)/100;if(n>0.01)out.push({from,to,amount:n});else if(n<-0.01)out.push({from:to,to:from,amount:-n});});return out;}
 function useWindowWidth(){const[w,setW]=useState(window.innerWidth);useEffect(()=>{const h=()=>setW(window.innerWidth);window.addEventListener('resize',h);return()=>window.removeEventListener('resize',h);},[]);return w;}
 const Avatar=({user,size=34})=><div style={{width:size,height:size,borderRadius:'50%',background:C.card,display:'flex',alignItems:'center',justifyContent:'center',fontSize:size*0.52,flexShrink:0,border:`2px solid ${C.border}`}}>{user?.avatar||'👤'}</div>;
 const Btn=({children,onClick,variant='primary',style={},disabled,full,loading})=>{const v={primary:{background:C.accent,color:'#000',fontWeight:700},ghost:{background:'transparent',color:C.sub,border:`1px solid ${C.border}`},danger:{background:C.danger,color:'#fff',fontWeight:700},purple:{background:C.purple,color:'#000',fontWeight:700},surface:{background:C.surface,color:C.text,border:`1px solid ${C.border}`}};return <button onClick={onClick} disabled={disabled||loading} style={{...v[variant],padding:'10px 18px',borderRadius:12,border:'none',cursor:(disabled||loading)?'not-allowed':'pointer',fontSize:14,opacity:(disabled||loading)?0.5:1,transition:'all .15s',width:full?'100%':undefined,display:'inline-flex',alignItems:'center',justifyContent:'center',gap:6,...style}}>{loading?'⏳ ':''}{children}</button>;};
@@ -54,12 +55,15 @@ function SettleModal({open,onClose,debts,allUsers,currentUser,onSettle,currency,
 
   // Determine which user IDs we are settling for
   const myIds=settleFor==='couple'&&partner?[currentUser.id,partner.id]:[currentUser.id];
+  // Never list our own partner as a creditor — couples share finances
+  const household=partner?[currentUser.id,partner.id]:[currentUser.id];
 
-  // Aggregate debts into per-creditor net totals
+  // Aggregate the DIRECT debts (what we actually owe each person) into per-creditor totals
   // A creditor can be a userId or a jointAccount id (ja_...)
   const creditorMap={};
   debts.forEach(d=>{
     if(!myIds.includes(d.from))return; // only debts WE owe
+    if(household.includes(d.to))return;// skip our own partner — shared finances, nothing to settle
     const key=d.to;
     creditorMap[key]=(creditorMap[key]||0)+d.amount;
   });
@@ -92,6 +96,7 @@ function SettleModal({open,onClose,debts,allUsers,currentUser,onSettle,currency,
   };
 
   return <Modal open={open} onClose={onClose} title='💸 Settle Up'>
+    <div style={{fontSize:12,color:C.muted,marginBottom:12,lineHeight:1.5}}>These are the people you owe directly. Pay each person their amount.</div>
     {partner&&<div style={{display:'flex',gap:8,marginBottom:14}}>{['self','couple'].map(f=><div key={f} onClick={()=>{setSettleFor(f);setSelected([]);}} style={{flex:1,textAlign:'center',padding:'10px',borderRadius:12,cursor:'pointer',background:f===settleFor?(f==='couple'?C.purpleDim:C.accentDim):'transparent',border:`1px solid ${f===settleFor?(f==='couple'?C.purple:C.accent):C.border}`,color:f===settleFor?(f==='couple'?C.purple:C.accent):C.muted,fontWeight:600,fontSize:13,transition:'all .15s'}}>{f==='self'?'Just Me':`💑 Me & ${partner.name}`}</div>)}</div>}
     {settleFor==='couple'&&<div style={{background:C.purpleDim,border:`1px solid ${C.purple}44`,borderRadius:10,padding:'10px 13px',marginBottom:12,fontSize:13,color:C.purple}}>💡 Settling on behalf of both you and {partner?.name}.</div>}
     <div style={{display:'flex',flexDirection:'column',gap:8}}>
@@ -112,7 +117,7 @@ function SettleModal({open,onClose,debts,allUsers,currentUser,onSettle,currency,
           </div>
           <div style={{textAlign:'right',flexShrink:0}}>
             <div style={{fontSize:16,fontWeight:800,color:C.danger}}>{fmt(c.amount,currency)}</div>
-            <div style={{fontSize:10,color:C.muted,marginTop:1}}>net balance</div>
+            <div style={{fontSize:10,color:C.muted,marginTop:1}}>you owe</div>
           </div>
         </div>;
       })}
@@ -195,6 +200,7 @@ export default function App(){
   const handleMarkAllRead=async()=>{setNotifications(ns=>ns.map(n=>({...n,read:true})));try{await api.notifications.readAll();}catch{}};
   const handleUpdateProfile=(user)=>{setCurrentUser(user);setCurrency(user.currency||DEFAULT_CURRENCY);};
   const debts=computeDebts(expenses,allUsers.length>0?allUsers:[currentUser].filter(Boolean),allJointAccounts);
+  const settleDebts=computeDirectDebts(expenses,allJointAccounts);
   const unreadCount=notifications.filter(n=>!n.read).length;
   const navigate=v=>{setView(v);setSelectedGroup(null);setDrawerOpen(false);setShowNotifications(false);};
 
@@ -225,7 +231,7 @@ export default function App(){
   </div>
   {isMobile&&<div style={{position:'fixed',bottom:0,left:0,right:0,background:C.surface,borderTop:`1px solid ${C.border}`,display:'flex',zIndex:200}}>{NAV.map(n=><div key={n.id} onClick={()=>navigate(n.id)} style={{flex:1,display:'flex',flexDirection:'column',alignItems:'center',justifyContent:'center',padding:'9px 4px 7px',cursor:'pointer',color:view===n.id?C.accent:C.muted,transition:'all .15s',position:'relative'}}>{view===n.id&&<div style={{position:'absolute',top:0,left:'25%',right:'25%',height:2,background:C.accent,borderRadius:'0 0 3px 3px'}}/>}<span style={{fontSize:19}}>{n.icon}</span><span style={{fontSize:10,marginTop:3,fontWeight:view===n.id?700:400}}>{n.label}</span></div>)}</div>}
   <ExpenseFormModal open={showExpForm} onClose={()=>{setShowExpForm(false);setEditingExpense(null);}} groups={groups} groupMembers={groupMembers} currentUser={currentUser} onSaved={handleExpenseSaved} editingExpense={editingExpense} currency={currency} jointAccount={jointAccount}/>
-  <SettleModal open={showSettle} onClose={()=>setShowSettle(false)} debts={debts} allUsers={allUsers} currentUser={currentUser} onSettle={handleSettle} currency={currency} jointAccount={jointAccount} allJointAccounts={allJointAccounts}/>
+  <SettleModal open={showSettle} onClose={()=>setShowSettle(false)} debts={settleDebts} allUsers={allUsers} currentUser={currentUser} onSettle={handleSettle} currency={currency} jointAccount={jointAccount} allJointAccounts={allJointAccounts}/>
   <GroupFormModal open={showGroupForm} onClose={()=>{setShowGroupForm(false);setEditingGroup(null);}} existingGroup={editingGroup} currentUser={currentUser} onSaved={handleGroupSaved}/>
   <ConfirmDialog open={!!confirmDelete} onClose={()=>setConfirmDelete(null)} title='Delete Expense' body='This will permanently remove the expense and update all balances.' onConfirm={()=>handleDeleteExpense(confirmDelete)} confirmLabel='Delete Expense'/>
   </div>;
