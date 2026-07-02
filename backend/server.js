@@ -255,6 +255,16 @@ app.patch("/api/groups/:id", auth, async (req,res)=>{
     const exIds=ex.map(r=>r.user_id);
     const newOnes=all.filter(u=>!exIds.includes(u));
     const removed=exIds.filter(u=>!all.includes(u)&&u!==req.userId);
+    // Guard: a member with unsettled money in this group cannot be removed —
+    // their splits would keep counting in the debt math with no name to show.
+    for (const u of removed) {
+      const {rows:[busy]} = await db.query(
+        "SELECT 1 FROM expenses WHERE group_id=$1 AND settled=FALSE AND (paid_by=$2 OR COALESCE((splits->>$2)::numeric,0)>0.009) LIMIT 1",[gid,u]);
+      if (busy) {
+        const {rows:[bu]} = await db.query("SELECT name FROM users WHERE id=$1",[u]);
+        return res.status(400).json({error:`${bu?bu.name:"This member"} still has unsettled expenses in this group — settle up first, then remove them`});
+      }
+    }
     for (const u of newOnes) await db.query("INSERT INTO group_members(group_id,user_id,joined_at) VALUES($1,$2,$3) ON CONFLICT DO NOTHING",[gid,u,now]);
     for (const u of removed) await db.query("DELETE FROM group_members WHERE group_id=$1 AND user_id=$2",[gid,u]);
     const {rows:[me]} = await db.query("SELECT * FROM users WHERE id=$1",[req.userId]);
@@ -350,13 +360,64 @@ app.delete("/api/expenses/:id", auth, async (req,res)=>{
   res.json({ok:true});
 });
 
-// Settling works by RECORDING A PAYMENT, not by flipping `settled` flags.
-// The debts sent here come from the frontend's computeDebts(), which are
-// simplified/remapped/netted — they no longer map 1:1 onto expenses, so
-// marking whole expenses settled corrupts other members' balances.
-// A payment expense (paid_by=debtor, splits={creditor: amount}) nets the
-// debt to exactly zero in computeDebts regardless of simplification.
+// Settling works by RECORDING A PAYMENT, not by flipping `settled` flags —
+// a payment expense (paid_by=debtor, splits={creditor: amount}) nets the
+// debt to exactly zero in the frontend's direct-debt engine.
+//
+// Safety on top of that:
+//  - requests are serialized through an in-process mutex (single instance),
+//  - the requested amount is re-verified against the CURRENT balance so a
+//    stale/double-tapped settle can't overpay (409 instead),
+//  - all writes happen in one DB transaction (no partial settlements).
+
+// Household of an entity: a user + their couple partner + their couple's JA
+// (soft-deleted JAs included — old expenses still reference them).
+async function householdEntities(id) {
+  const ents=new Set([id]);
+  if (id.startsWith("ja_")) {
+    const {rows:[j]} = await db.query("SELECT * FROM joint_accounts WHERE id=$1",[id]);
+    if (!j) return null;
+    ents.add(j.partner1_id); ents.add(j.partner2_id);
+    const {rows:us} = await db.query("SELECT id FROM users WHERE couple_id=$1",[j.couple_id]);
+    us.forEach(u=>ents.add(u.id));
+    return ents;
+  }
+  const {rows:[u]} = await db.query("SELECT * FROM users WHERE id=$1",[id]);
+  if (!u) return null;
+  if (u.couple_id) {
+    const {rows:us} = await db.query("SELECT id FROM users WHERE couple_id=$1",[u.couple_id]);
+    us.forEach(x=>ents.add(x.id));
+    const {rows:js} = await db.query("SELECT id FROM joint_accounts WHERE couple_id=$1",[u.couple_id]);
+    js.forEach(j=>ents.add(j.id));
+  }
+  return ents;
+}
+
+// Net amount the debtor side D still owes the creditor side C, computed from
+// the unsettled expenses visible to the requester (mirrors the frontend's
+// direct-debt netting: payer's JA partners exempt from their own JA).
+function netOwed(exps, jaPartnersOf, D, C) {
+  let net=0;
+  for (const e of exps) {
+    const p=e.paid_by, jp=jaPartnersOf[p]||[];
+    const splits=typeof e.splits==="object"?e.splits:JSON.parse(e.splits||"{}");
+    for (const [uid,share] of Object.entries(splits)) {
+      if (uid===p||jp.includes(uid)) continue;
+      const s=Number(share)||0;
+      if (D.has(uid)&&C.has(p)) net+=s;
+      else if (C.has(uid)&&D.has(p)) net-=s;
+    }
+  }
+  return Math.round(net*100)/100;
+}
+
+let _settleChain=Promise.resolve();
 app.post("/api/expenses/settle-batch", auth, async (req,res)=>{
+  // In-process mutex: settles run one at a time so concurrent requests see
+  // each other's payments in the balance re-verification below.
+  const prev=_settleChain; let _release; _settleChain=new Promise(r=>{_release=r;});
+  await prev.catch(()=>{});
+  const client=await pool.connect();
   try {
     const {debts} = req.body;
     if (!Array.isArray(debts)||debts.length===0) return res.status(400).json({error:"debts array required"});
@@ -369,7 +430,11 @@ app.post("/api/expenses/settle-batch", auth, async (req,res)=>{
     }
     const {rows:myGroupRows} = await db.query("SELECT group_id FROM group_members WHERE user_id=$1",[req.userId]);
     const myGroupIds=myGroupRows.map(r=>r.group_id);
-    const affected=new Set(), now=Date.now(), payments=[];
+    // Snapshot of all unsettled expenses the requester can see + JA partner map
+    const {rows:allExps} = await db.query("SELECT * FROM expenses WHERE settled=FALSE AND group_id=ANY($1)",[myGroupIds]);
+    const {rows:allJas} = await db.query("SELECT * FROM joint_accounts",[]);
+    const jaPartnersOf={}; allJas.forEach(j=>{jaPartnersOf[j.id]=[j.partner1_id,j.partner2_id];});
+    const affected=new Set(), now=Date.now(), payments=[], writes=[];
     // Validate everything before writing anything
     for (const d of debts) {
       if (!d||typeof d.from!=="string"||typeof d.to!=="string") return res.status(400).json({error:"each debt needs from and to"});
@@ -394,6 +459,17 @@ app.post("/api/expenses/settle-batch", auth, async (req,res)=>{
       }
       const {rows:[fu]} = await db.query("SELECT name FROM users WHERE id=$1",[d.from]);
       if (!fu) return res.status(400).json({error:"Unknown debtor"});
+      // Balance re-verification: the amount must not exceed what is still owed
+      // (either by the debtor alone, or by the debtor's household for couple
+      // settles). Prevents stale-screen double settlement.
+      const cEnts=await householdEntities(d.to);
+      const dHouse=await householdEntities(d.from);
+      if (!cEnts||!dHouse) return res.status(400).json({error:"Unknown debtor or creditor"});
+      if (cEnts.has(d.from)) return res.status(400).json({error:"You cannot settle within your own household"});
+      const selfNet=netOwed(allExps,jaPartnersOf,new Set([d.from]),cEnts);
+      const houseNet=netOwed(allExps,jaPartnersOf,dHouse,cEnts);
+      const stillOwed=Math.max(selfNet,houseNet);
+      if (d._amount>stillOwed+0.02) return res.status(409).json({error:`Balances have changed — still owed is ${Math.max(0,stillOwed).toFixed(2)}, not ${d._amount.toFixed(2)}. Refresh and settle again.`});
       // Pick a group shared by requester, debtor and creditor — prefer the one
       // holding the most recent unsettled expense paid by the creditor
       const {rows:shared} = await db.query(
@@ -408,25 +484,34 @@ app.post("/api/expenses/settle-batch", auth, async (req,res)=>{
         [d.to,shared.map(r=>r.group_id)]);
       if (pref) gid=pref.group_id;
       const id=uuidv4();
-      await db.query(
-        "INSERT INTO expenses(id,description,amount,paid_by,group_id,category,date,split_type,participants,splits,settled,note,created_by,created_at,updated_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,FALSE,$11,$12,$13,$14)",
-        [id,`${fu.name} paid ${toName}`,d._amount,d.from,gid,"settlement",new Date(now).toISOString().split("T")[0],"settlement",JSON.stringify([d.to]),JSON.stringify({[d.to]:d._amount}),"Settle-up payment",req.userId,now,now]);
+      writes.push({sql:"INSERT INTO expenses(id,description,amount,paid_by,group_id,category,date,split_type,participants,splits,settled,note,created_by,created_at,updated_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,FALSE,$11,$12,$13,$14)",
+        params:[id,`${fu.name} paid ${toName}`,d._amount,d.from,gid,"settlement",new Date(now).toISOString().split("T")[0],"settlement",JSON.stringify([d.to]),JSON.stringify({[d.to]:d._amount}),"Settle-up payment",req.userId,now,now]});
+      // Make this payment visible to the balance check of the NEXT debt in the same batch
+      allExps.push({paid_by:d.from,splits:{[d.to]:d._amount},settled:false});
       affected.add(gid);
       payments.push(id);
-      // Notify the creditor(s)
       const msg=`${me.name} settled up: ${fu.name} paid ${toName} ${d._amount.toFixed(2)}`;
       for (const pid of creditorUserIds.filter(p=>p!==req.userId)) {
         const nid=uuidv4();
-        await db.query("INSERT INTO notifications(id,user_id,message,created_at) VALUES($1,$2,$3,$4)",[nid,pid,msg,now]);
-        broadcastToUsers([pid],"notification",{id:nid,message:msg,read:false,createdAt:now});
+        writes.push({sql:"INSERT INTO notifications(id,user_id,message,created_at) VALUES($1,$2,$3,$4)",params:[nid,pid,msg,now],
+          notify:{userId:pid,payload:{id:nid,message:msg,read:false,createdAt:now}}});
       }
     }
+    // All validated — write atomically
+    await client.query("BEGIN");
+    for (const w of writes) await client.query(w.sql,w.params);
+    await client.query("COMMIT");
+    // Broadcast only after commit
+    for (const w of writes) if (w.notify) broadcastToUsers([w.notify.userId],"notification",w.notify.payload);
     for (const gid of affected) {
       const {rows} = await db.query("SELECT * FROM expenses WHERE group_id=$1",[gid]);
       await broadcastToGroup(gid,"expenses_batch_updated",{groupId:gid,expenses:rows.map(parseExp)});
     }
     res.json({ok:true,paymentIds:payments});
-  } catch(e){console.error("Settle-batch:",e.message);res.status(500).json({error:"Server error"});}
+  } catch(e){
+    try { await client.query("ROLLBACK"); } catch(_){}
+    console.error("Settle-batch:",e.message);res.status(500).json({error:"Server error"});
+  } finally { client.release(); _release(); }
 });
 
 
