@@ -115,7 +115,8 @@ class WSManager {
 
     ws.onerror = () => {};
 
-    // Heartbeat
+    // Heartbeat (clear any previous timer first — reconnects must not stack intervals)
+    clearInterval(this._heartbeatInterval);
     this._heartbeatInterval = setInterval(() => {
       if (ws.readyState === window.WebSocket.OPEN) {
         ws.send(JSON.stringify({ type: 'ping' }));
